@@ -1,17 +1,22 @@
 import csv
-import logging
-import sys
-from dataclasses import dataclass, fields, astuple
+import time
+from dataclasses import dataclass, asdict
 from urllib.parse import urljoin
 
-import requests
-from bs4 import BeautifulSoup
 from selenium import webdriver
+from selenium.common import (
+    NoSuchElementException,
+    ElementNotInteractableException,
+    ElementClickInterceptedException,
+)
+from selenium.webdriver.chrome.webdriver import WebDriver
 from selenium.webdriver.common.by import By
-from selenium.webdriver.remote.webdriver import WebDriver
+from selenium.webdriver.remote.webelement import WebElement
+
+from tqdm import tqdm
+
 
 BASE_URL = "https://webscraper.io/"
-# LAPTOP_URL = urljoin(BASE_URL, "test-sites/e-commerce/static/computers/laptops")
 HOME_URL = urljoin(BASE_URL, "test-sites/e-commerce/more/")
 
 
@@ -22,109 +27,106 @@ class Product:
     price: float
     rating: int
     num_of_reviews: int
-    additional_info: dict
-
-PRODUCT_FIELDS = [field.name for field in fields(Product)]
-
-_driver: WebDriver | None = None
-
-def get_driver() -> WebDriver:
-    return _driver
 
 
-def set_driver(new_driver: WebDriver) -> None:
-    global _driver
-    _driver = new_driver
+def scrape_single_product(product: WebElement) -> Product:
+    title = product.find_element(By.CLASS_NAME, "title").get_attribute("title")
+    price, _, description, num_of_reviews = product.text.split("\n")
+    price = float(price.replace("$", ""))
+    num_of_reviews = int(num_of_reviews.split()[0])
 
+    rating = (
+        product.find_element(By.CLASS_NAME, "ratings")
+        .find_elements(By.TAG_NAME, "p")[-1]
+        .get_attribute("data-rating")
+    )
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="[%(levelname)8s: %(message)s]",
-    handlers=[
-        logging.FileHandler("parser.log"),
-        logging.StreamHandler(sys.stdout)
-    ]
-)
+    rating = int(rating) if rating else 5
 
-
-def parse_hdd_block_proces(product_soup: BeautifulSoup) -> dict[str, float]:
-    detail_url = urljoin(BASE_URL, product_soup.select_one(".title")["href"])
-    driver = get_driver()
-    driver.get(detail_url)
-    swatches = driver.find_element(By.CLASS_NAME, "swatches")
-    buttons = swatches.find_elements(By.TAG_NAME, "button")
-
-    prices = {}
-
-    for button in buttons:
-        if not button.get_property("disabled"):
-            button.click()
-            prices[button.get_property("value")] = float(driver.find_element(
-                By.CLASS_NAME, "price"
-            ).text.replace("$", ""))
-
-    return prices
-
-
-def parse_single_product(product_soup: BeautifulSoup) -> Product:
-    hdd_prices = parse_hdd_block_proces(product_soup)
     return Product(
-        title=product_soup.select_one(".title")["title"],
-        description=product_soup.select_one(".description").text,
-        price=float(product_soup.select_one(".price").text.replace("$", "")),
-        rating=int(product_soup.select_one("p[data-rating]")["data-rating"]),
-        num_of_reviews=int(
-            product_soup.select_one(".ratings > p.review-count").text.split()[0]
-        ),
-        additional_info={"hdd_prices": hdd_prices}
+        title=title,
+        price=price,
+        description=description,
+        num_of_reviews=num_of_reviews,
+        rating=rating,
     )
 
 
-def get_num_pages(page_soup: BeautifulSoup) -> int:
-    pagination = page_soup.select_one(".pagination")
+def scrape_page(url: str, driver: WebDriver) -> list[Product]:
+    driver.get(url)
 
-    if pagination is None:
-        return 1
+    try:
+        if accept := driver.find_element(By.CLASS_NAME, "acceptCookies"):
+            time.sleep(0.5)
+            accept.click()
 
-    return int(pagination.select("li")[-2].text)
+    except NoSuchElementException:
+        pass
+
+    try:
+        while more := driver.find_element(
+                By.CLASS_NAME, "ecomerce-items-scroll-more"
+        ):
+            if not more.is_displayed():
+                break
+            more.click()
+
+    except (
+        NoSuchElementException,
+        ElementNotInteractableException,
+        ElementClickInterceptedException,
+    ):
+        pass
+
+    products = driver.find_elements(By.CLASS_NAME, "card-body")
+
+    return [scrape_single_product(product) for product in products]
 
 
-def get_single_page_products(page_soup: BeautifulSoup) -> [Product]:
-    products = page_soup.select(".thumbnail")
-
-    return [parse_single_product(product_soup) for product_soup in products]
-
-
-def get_laptop_products() -> list[Product]:
-    page = requests.get(HOME_URL).content
-    first_page_soup = BeautifulSoup(page, "html.parser")
-
-    num_pages = get_num_pages(first_page_soup)
-
-    all_products = get_single_page_products(first_page_soup)
-
-    for page_num in range(2, num_pages + 1):
-        page = requests.get(HOME_URL, {"page": page_num}).content
-        soup = BeautifulSoup(page, "html.parser")
-        all_products.extend(get_single_page_products(soup))
-        break
-
-    return all_products
+def get_urls(class_name: str, driver: WebDriver) -> list[tuple]:
+    return [
+        (elem.text.lower(), elem.get_attribute("href"))
+        for elem in driver.find_elements(By.CLASS_NAME, class_name)
+    ]
 
 
-def write_to_file(products: list[Product], name_of_file: str) -> None:
-    with open(name_of_file, "w", newline="") as file:
-        writer = csv.writer(file)
-        writer.writerow(PRODUCT_FIELDS)
-        writer.writerows([astuple(product) for product in products])
+def get_sidebar_urls(home_url: str, driver: WebDriver) -> list[tuple | tuple[str, str]]:
+    driver.get(home_url)
+    categories = get_urls("category-link", driver)
+
+    subcategories = []
+    for _, url in categories:
+        driver.get(url)
+        subcategories.extend(get_urls("subcategory-link", driver))
+
+    return [("home", home_url)] + categories + subcategories
+
+
+def write_to_csv(filename: str, products: list[Product]) -> None:
+    with open(filename, "w", newline="") as csvfile:
+        fields = ("title", "description", "price", "rating", "num_of_reviews")
+        writer = csv.DictWriter(csvfile, fieldnames=fields)
+        writer.writeheader()
+
+        for product in products:
+            writer.writerow(asdict(product))
 
 
 def get_all_products() -> None:
-    with webdriver.Chrome() as new_diver:
-        set_driver(new_diver)
-        home_products = get_laptop_products()
-        write_to_file(home_products, "home.csv")
+    options = webdriver.ChromeOptions()
+    options.add_argument("--headless=new")
+    driver = webdriver.Chrome(options=options)
+
+    urls = get_sidebar_urls(HOME_URL, driver)
+
+    for tab_name, url in tqdm(urls):
+        page = scrape_page(url, driver)
+        write_to_csv(f"{tab_name}.csv", page)
+
+    driver.quit()
 
 
 if __name__ == "__main__":
+    print("Running selenium scraper...")
     get_all_products()
+    print("Done!")
